@@ -79,8 +79,11 @@ def run_graph_classification(args, device):
         dropout=args.dropout,
         use_toppool=args.use_toppool,
         pool_ratio=args.pool_ratio,
-        lambda_reg=args.lambda_reg,
-        lambda_smooth=args.lambda_smooth,
+        lambda_reg=args.lambda_reg    if args.use_reg else 0.0,
+        lambda_smooth=args.lambda_smooth if args.use_reg else 0.0,
+        use_embed_uts_descriptor=args.use_embed_uts,
+        use_graph_uts_descriptor=args.use_graph_uts,
+        use_ricci=args.use_ricci,
     ).to(device)
 
     optimizer = optim.AdamW(model.parameters(),
@@ -88,9 +91,13 @@ def run_graph_classification(args, device):
     scheduler = optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=args.epochs, eta_min=1e-5)
 
+    need_nx = args.use_reg or args.use_graph_uts
+
     print(f"\n── Graph Classification: {args.dataset} ──────────────────")
     print(f"   Graphs: {n}  |  Classes: {dataset.num_classes}  "
           f"|  Features: {in_dim}")
+    print(f"   Flags  : embed_uts={args.use_embed_uts}  graph_uts={args.use_graph_uts}  "
+          f"ricci={args.use_ricci}  toppool={args.use_toppool}  reg={args.use_reg}")
     print(f"   Model params: {sum(p.numel() for p in model.parameters()):,}\n")
 
     best_val_acc = 0.0
@@ -99,9 +106,13 @@ def run_graph_classification(args, device):
     for epoch in range(1, args.epochs + 1):
         train_metrics = train_graph_classifier(
             model, train_loader, optimizer, device,
-            use_reg=args.use_reg
+            use_reg=args.use_reg,
+            need_nx_graphs=need_nx,
         )
-        val_metrics = evaluate_graph_classifier(model, val_loader, device)
+        val_metrics = evaluate_graph_classifier(
+            model, val_loader, device,
+            need_nx_graphs=need_nx,
+        )
         scheduler.step()
 
         if val_metrics["accuracy"] > best_val_acc:
@@ -125,7 +136,8 @@ def run_graph_classification(args, device):
 
     # Final test
     model.load_state_dict(torch.load("best_graph_model.pt"))
-    test_metrics = evaluate_graph_classifier(model, test_loader, device)
+    test_metrics = evaluate_graph_classifier(model, test_loader, device,
+                                             need_nx_graphs=need_nx)
     print(f"\n  ✓ Test Accuracy: {test_metrics['accuracy']:.4f}  "
           f"(best val: {best_val_acc:.4f})")
 
@@ -148,14 +160,21 @@ def run_node_classification(args, device):
     dataset = Planetoid(root=f"data/{args.dataset}", name=args.dataset)
     data    = dataset[0].to(device)
 
+    # Cora/CiteSeer are large single graphs — use chunked local UTS encoder
+    large_graph = data.num_nodes > 1000
+
     model = UTSNodeClassifier(
         in_dim=dataset.num_node_features,
         hidden_dim=args.hidden_dim,
         num_classes=dataset.num_classes,
         num_layers=args.num_layers,
         dropout=args.dropout,
-        lambda_reg=args.lambda_reg,
-        lambda_smooth=args.lambda_smooth,
+        use_local_uts=args.use_embed_uts,
+        local_uts_hops=2,
+        local_uts_max_nodes=30,
+        lambda_reg=args.lambda_reg    if args.use_reg else 0.0,
+        lambda_smooth=args.lambda_smooth if args.use_reg else 0.0,
+        large_graph=large_graph,
     ).to(device)
 
     optimizer = optim.AdamW(model.parameters(),
@@ -165,12 +184,13 @@ def run_node_classification(args, device):
     print(f"   Nodes: {data.num_nodes}  |  "
           f"Classes: {dataset.num_classes}  |  "
           f"Features: {dataset.num_node_features}")
+    print(f"   Flags: local_uts={args.use_embed_uts}  "
+          f"reg={args.use_reg}  large_graph={large_graph}")
     print(f"   Model params: {sum(p.numel() for p in model.parameters()):,}\n")
 
     best_val_acc = 0.0
     patience_cnt = 0
 
-    # Pre-compute nx graph once (expensive for Ricci — disable for large graphs)
     nx_graph = [to_networkx(data.cpu(), to_undirected=True)] \
                if (args.use_reg and data.num_nodes < 5000) else None
 
@@ -246,24 +266,62 @@ def run_pretrain(args, device):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--task",         type=str,   default="graph",
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="""
+Graph/node classification and contrastive pretraining runner.
+All UTS and feature flags default to OFF — opt in explicitly.
+
+Examples:
+  # Plain GIN graph classification (baseline)
+  python run_experiment.py --task graph --dataset MUTAG
+
+  # Graph classification with EmbeddingUTS descriptor + analysis
+  python run_experiment.py --task graph --dataset PROTEINS \\
+      --use_embed_uts --analyze --patience 50 --epochs 300
+
+  # Graph classification with all components
+  python run_experiment.py --task graph --dataset PROTEINS \\
+      --use_embed_uts --use_graph_uts --use_toppool --use_reg --analyze
+
+  # Node classification
+  python run_experiment.py --task node --dataset Cora --num_layers 2
+
+  # Contrastive pretraining
+  python run_experiment.py --task pretrain --dataset PROTEINS
+        """)
+
+    # Core
+    parser.add_argument("--task",          type=str,   default="graph",
                         choices=["graph", "node", "pretrain"])
-    parser.add_argument("--dataset",      type=str,   default="MUTAG")
-    parser.add_argument("--hidden_dim",   type=int,   default=128)
-    parser.add_argument("--num_layers",   type=int,   default=4)
-    parser.add_argument("--batch_size",   type=int,   default=32)
-    parser.add_argument("--epochs",       type=int,   default=200)
-    parser.add_argument("--lr",           type=float, default=1e-3)
-    parser.add_argument("--dropout",      type=float, default=0.3)
-    parser.add_argument("--pool_ratio",   type=float, default=0.5)
-    parser.add_argument("--lambda_reg",   type=float, default=0.01)
-    parser.add_argument("--lambda_smooth",type=float, default=0.005)
-    parser.add_argument("--patience",     type=int,   default=30)
-    parser.add_argument("--use_toppool",  action="store_true", default=True)
-    parser.add_argument("--use_reg",      action="store_true", default=True)
-    parser.add_argument("--analyze",      action="store_true", default=False)
-    parser.add_argument("--seed",         type=int,   default=42)
+    parser.add_argument("--dataset",       type=str,   default="MUTAG")
+    parser.add_argument("--hidden_dim",    type=int,   default=128)
+    parser.add_argument("--num_layers",    type=int,   default=4)
+    parser.add_argument("--batch_size",    type=int,   default=32)
+    parser.add_argument("--epochs",        type=int,   default=200)
+    parser.add_argument("--lr",            type=float, default=1e-3)
+    parser.add_argument("--dropout",       type=float, default=0.3)
+    parser.add_argument("--pool_ratio",    type=float, default=0.5)
+    parser.add_argument("--lambda_reg",    type=float, default=0.01)
+    parser.add_argument("--lambda_smooth", type=float, default=0.005)
+    parser.add_argument("--patience",      type=int,   default=30)
+    parser.add_argument("--seed",          type=int,   default=42)
+
+    # UTS descriptor flags — ALL default False
+    parser.add_argument("--use_embed_uts", action="store_true", default=False,
+                        help="Concatenate EmbeddingUTS(H) to readout (§4.1)")
+    parser.add_argument("--use_graph_uts", action="store_true", default=False,
+                        help="Concatenate GraphUTS(G) to readout (§4.1 extension)")
+    parser.add_argument("--use_ricci",     action="store_true", default=False,
+                        help="Enable Ricci curvature in GraphUTS (slow on large graphs)")
+
+    # Architecture / training flags — ALL default False
+    parser.add_argument("--use_toppool",   action="store_true", default=False,
+                        help="Enable UTSTopPool pooling layer (§4.3)")
+    parser.add_argument("--use_reg",       action="store_true", default=False,
+                        help="Enable TopoRegLoss + LayerSmoothLoss (§4.2)")
+    parser.add_argument("--analyze",       action="store_true", default=False,
+                        help="Run UTSAnalyzer after training (§4.4 plots + OSI)")
 
     args   = parser.parse_args()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
