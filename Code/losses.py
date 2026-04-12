@@ -11,10 +11,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
-from uts import EmbeddingUTS, GraphUTS
+from uts      import EmbeddingUTS, GraphUTS
+from diff_uts import DifferentiableEmbeddingUTS
 
-# GraphUTS.DIM is determined by GraphSignature.compute() output length (27).
-# EmbeddingUTS.DIM = 14.  The align layer bridges the two spaces.
+# GraphUTS (GraphSignature-based) is always a fixed constant computed from the
+# input graph topology — it never needs to be differentiable in any loss because
+# it is not a function of model parameters.
+#
+# EmbeddingUTS (GUDHI-based) is used only in §4.1 descriptor (detached, no grad).
+#
+# DifferentiableEmbeddingUTS is used in all loss functions where gradients must
+# flow back through the topological signature to the GNN encoder.
 
 
 # ---------------------------------------------------------------------------
@@ -34,44 +41,53 @@ class TopoRegLoss(nn.Module):
 
     def __init__(self, lambda_reg: float = 0.01, use_ricci: bool = False):
         super().__init__()
-        self.lambda_reg   = lambda_reg
-        self.graph_uts    = GraphUTS(use_ricci=use_ricci, use_persistence=True)
-        self.embed_uts    = EmbeddingUTS()
-        # Learnable projection: GraphUTS.DIM → EmbeddingUTS.DIM
-        self.align = nn.Linear(GraphUTS.DIM, EmbeddingUTS.DIM)
+        self.lambda_reg  = lambda_reg
+        self.graph_uts   = GraphUTS(use_ricci=use_ricci, use_persistence=True)
+        self.diff_uts    = DifferentiableEmbeddingUTS()   # replaces EmbeddingUTS
+        # Learnable projection: GraphUTS.DIM → DifferentiableEmbeddingUTS.DIM
+        self.align = nn.Linear(GraphUTS.DIM, DifferentiableEmbeddingUTS.DIM)
 
     def forward(self,
                 H: torch.Tensor,
                 batch: torch.Tensor,
-                nx_graphs: list) -> torch.Tensor:
+                nx_graphs: list = None,
+                graph_uts_cache: dict = None,
+                graph_indices: list = None) -> torch.Tensor:
         """
         Args:
-            H          : (total_N, d) final node embeddings
-            batch      : (total_N,)   graph index
-            nx_graphs  : list of nx.Graph, one per graph in batch
+            H               : (total_N, d) final node embeddings
+            batch           : (total_N,) graph index
+            nx_graphs       : list of nx.Graph — used if cache not provided
+            graph_uts_cache : dict {dataset_idx: np.ndarray} precomputed vectors
+            graph_indices   : list of dataset indices for graphs in this batch
         Returns:
             scalar loss
         """
-        num_graphs = len(nx_graphs)
         device     = H.device
+        num_graphs = int(batch.max().item()) + 1 if batch is not None else 1
         total_loss = torch.tensor(0.0, device=device)
 
         for g in range(num_graphs):
-            mask  = (batch == g)
-            H_g   = H[mask]
+            mask = (batch == g)
+            H_g  = H[mask]
 
-            # Embedding-side UTS (differentiable path through align)
-            e_uts = self.embed_uts.compute(H_g.detach())          # numpy
-            e_uts_t = torch.tensor(e_uts, dtype=torch.float32,
-                                   device=device)
+            # Embedding-side — DifferentiableEmbeddingUTS, no detach
+            e_uts = self.diff_uts.compute(H_g)
 
-            # Graph-side UTS (structural anchor, no grad)
-            g_uts   = self.graph_uts.safe_compute(nx_graphs[g])    # numpy, crash-safe
-            g_uts_t = torch.tensor(g_uts, dtype=torch.float32,
-                                   device=device)
-            g_uts_proj = self.align(g_uts_t)                       # (E_DIM,)
+            # Graph-side — use cache if available, else recompute
+            if graph_uts_cache is not None and graph_indices is not None:
+                idx   = graph_indices[g]
+                g_uts = graph_uts_cache.get(
+                    idx, np.zeros(GraphUTS.DIM, dtype=np.float32)
+                )
+            elif nx_graphs is not None:
+                g_uts = self.graph_uts.safe_compute(nx_graphs[g])
+            else:
+                g_uts = np.zeros(GraphUTS.DIM, dtype=np.float32)
 
-            total_loss = total_loss + F.mse_loss(e_uts_t, g_uts_proj)
+            g_uts_t    = torch.tensor(g_uts, dtype=torch.float32, device=device)
+            g_uts_proj = self.align(g_uts_t)
+            total_loss = total_loss + F.mse_loss(e_uts, g_uts_proj)
 
         return self.lambda_reg * total_loss / max(num_graphs, 1)
 
@@ -140,7 +156,7 @@ class TopoContrastLoss(nn.Module):
         self.lambda_contrast = lambda_contrast
         self.temperature     = temperature
         self.use_ntxent      = use_ntxent
-        self.uts             = EmbeddingUTS()
+        self.diff_uts        = DifferentiableEmbeddingUTS()   # replaces EmbeddingUTS
 
     # ------------------------------------------------------------------
     def _ntxent(self, z1: torch.Tensor, z2: torch.Tensor) -> torch.Tensor:
@@ -183,11 +199,10 @@ class TopoContrastLoss(nn.Module):
         for g in range(num_graphs):
             m1 = (batch1 == g)
             m2 = (batch2 == g)
-            s1 = self.uts.compute(H1[m1].detach())
-            s2 = self.uts.compute(H2[m2].detach())
-            t1 = torch.tensor(s1, dtype=torch.float32, device=device)
-            t2 = torch.tensor(s2, dtype=torch.float32, device=device)
-            topo_loss = topo_loss + F.mse_loss(t1, t2)
+            # No detach — both views stay in computation graph
+            s1 = self.diff_uts.compute(H1[m1])
+            s2 = self.diff_uts.compute(H2[m2])
+            topo_loss = topo_loss + F.mse_loss(s1, s2)
 
         topo_loss = topo_loss / max(num_graphs, 1)
 
