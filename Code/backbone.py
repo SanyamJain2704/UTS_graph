@@ -13,7 +13,7 @@ import torch.nn.functional as F
 from torch_geometric.nn import GINConv, BatchNorm
 from torch_geometric.utils import to_networkx
 
-from uts import EmbeddingUTS
+from diff_uts import DifferentiableEmbeddingUTS
 
 
 # ---------------------------------------------------------------------------
@@ -61,7 +61,9 @@ class GINEncoder(nn.Module):
         self.dropout    = dropout
 
         uts_kwargs = uts_kwargs or {}
-        self.uts_computer = EmbeddingUTS(**uts_kwargs) if track_uts else None
+        # DifferentiableEmbeddingUTS — no detach, gradients flow back through
+        # uts_list into the GIN encoder for LayerSmoothLoss (§4.2)
+        self.uts_computer = DifferentiableEmbeddingUTS(**uts_kwargs) if track_uts else None
 
         # --- GIN layers ---------------------------------------------------
         self.convs = nn.ModuleList()
@@ -97,8 +99,9 @@ class GINEncoder(nn.Module):
             H = F.dropout(H, p=self.dropout, training=self.training)
 
             if self.track_uts:
-                # detach so TDA does not backprop (non-differentiable)
-                sig = self.uts_computer.compute_batch(H.detach(), batch)
-                uts_list.append(sig)           # (num_graphs, UTS_DIM)
+                # No detach — DifferentiableEmbeddingUTS stays in computation
+                # graph so LayerSmoothLoss gradients flow back into the encoder
+                sig = self.uts_computer.compute_batch(H, batch)
+                uts_list.append(sig)           # (num_graphs, DIM)
 
         return H, uts_list
