@@ -18,27 +18,41 @@ from losses import TopoContrastLoss
 # Utility: convert PyG batch to list of nx.Graph
 # ---------------------------------------------------------------------------
 
-def batch_to_nx(data):
-    """Convert a PyG Batch into a list of networkx graphs."""
+def batch_to_nx(data, min_nodes=3):
+    """
+    Convert a PyG Batch into a list of networkx graphs.
+    Graphs with fewer than min_nodes nodes get an empty placeholder
+    to avoid segfaults in GraphSignature's C++ extensions.
+    """
     graphs = []
     num_graphs = data.num_graphs
     for i in range(num_graphs):
-        mask = (data.batch == i)
+        mask     = (data.batch == i)
         node_idx = mask.nonzero(as_tuple=False).squeeze(1)
 
-        # Build sub-data for this graph
-        sub_edge_mask = mask[data.edge_index[0]] & mask[data.edge_index[1]]
-        sub_edges = data.edge_index[:, sub_edge_mask]
+        import networkx as nx
 
-        # Remap node indices to 0..n_i-1
+        # Guard: too-small graphs crash GUDHI/GraphRicciCurvature
+        if node_idx.size(0) < min_nodes:
+            G = nx.path_graph(min_nodes)   # minimal valid graph
+            graphs.append(G)
+            continue
+
+        sub_edge_mask = mask[data.edge_index[0]] & mask[data.edge_index[1]]
+        sub_edges     = data.edge_index[:, sub_edge_mask]
+
         old2new = {int(o): n for n, o in enumerate(node_idx.tolist())}
         src = [old2new[int(s)] for s in sub_edges[0].tolist()]
         dst = [old2new[int(d)] for d in sub_edges[1].tolist()]
 
-        import networkx as nx
         G = nx.Graph()
         G.add_nodes_from(range(node_idx.size(0)))
         G.add_edges_from(zip(src, dst))
+
+        # Guard: isolated graphs (no edges) crash Ricci curvature
+        if G.number_of_edges() == 0:
+            G = nx.path_graph(node_idx.size(0))
+
         graphs.append(G)
     return graphs
 
@@ -48,22 +62,19 @@ def batch_to_nx(data):
 # ---------------------------------------------------------------------------
 
 def train_graph_classifier(model, loader, optimizer, device,
-                            use_reg=True, need_nx_graphs=None):
+                            use_reg=True, need_nx_graphs=None,
+                            graph_uts_cache=None):
     """
     One epoch of supervised graph classification training.
 
     Args:
-        use_reg        : compute TopoRegLoss + LayerSmoothLoss
-        need_nx_graphs : force nx_graphs to be computed even if use_reg=False
-                         (needed when use_graph_uts_descriptor=True on V1)
-                         defaults to same value as use_reg if not set
-
-    Returns:
-        dict with mean losses: task, smooth, reg, total
+        use_reg         : compute TopoRegLoss + LayerSmoothLoss
+        need_nx_graphs  : force nx_graphs computation (fallback if no cache)
+        graph_uts_cache : dict {dataset_idx: np.ndarray} — precomputed GraphUTS.
+                          When provided, eliminates per-batch GraphUTS computation.
     """
-    # need_nx_graphs=True whenever either the loss or the descriptor needs it
     if need_nx_graphs is None:
-        need_nx_graphs = use_reg
+        need_nx_graphs = use_reg and graph_uts_cache is None
 
     model.train()
     total_task = total_smooth = total_reg = 0.0
@@ -73,8 +84,12 @@ def train_graph_classifier(model, loader, optimizer, device,
         data = data.to(device)
         optimizer.zero_grad()
 
-        nx_graphs = batch_to_nx(data) if need_nx_graphs else None
-        logits, aux = model(data, nx_graphs=nx_graphs)
+        # Only compute nx_graphs if cache unavailable and they're needed
+        nx_graphs = batch_to_nx(data) \
+                    if (need_nx_graphs and graph_uts_cache is None) else None
+
+        logits, aux = model(data, nx_graphs=nx_graphs,
+                            graph_uts_cache=graph_uts_cache)
 
         task_loss   = F.cross_entropy(logits, data.y)
         smooth_loss = aux["smooth_loss"]
@@ -101,15 +116,19 @@ def train_graph_classifier(model, loader, optimizer, device,
 
 
 @torch.no_grad()
-def evaluate_graph_classifier(model, loader, device, need_nx_graphs=False):
+def evaluate_graph_classifier(model, loader, device,
+                               need_nx_graphs=False,
+                               graph_uts_cache=None):
     model.eval()
     correct = total = 0
     total_loss = 0.0
 
     for data in loader:
         data      = data.to(device)
-        nx_graphs = batch_to_nx(data) if need_nx_graphs else None
-        logits, _ = model(data, nx_graphs=nx_graphs)
+        nx_graphs = batch_to_nx(data) \
+                    if (need_nx_graphs and graph_uts_cache is None) else None
+        logits, _ = model(data, nx_graphs=nx_graphs,
+                          graph_uts_cache=graph_uts_cache)
         pred      = logits.argmax(dim=-1)
         correct   += (pred == data.y).sum().item()
         total     += data.y.size(0)
